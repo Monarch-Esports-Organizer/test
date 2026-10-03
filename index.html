@@ -1,0 +1,294 @@
+// ==UserScript==
+// @name         Bypass Bicolink 2026
+// @namespace    http://tampermonkey.net/
+// @version      3.2.0
+// @description  Skips the current Bicolink and Bewbin flow and opens the verified final destination.
+// @author       artphoney
+// @match        *://bicolink.com/*
+// @match        *://*.bicolink.com/*
+// @match        *://bicolink.xyz/*
+// @match        *://*.bicolink.xyz/*
+// @match        *://lajangspot.web.id/*
+// @match        *://*.lajangspot.web.id/*
+// @match        *://bewbin.com/*
+// @match        *://*.bewbin.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+ 
+(function () {
+    'use strict';
+ 
+    const LOCK_KEY = '__bicolink_bypass_v3';
+    const LOCK_TTL = 10000;
+    const host = location.hostname.replace(/^www\./i, '').toLowerCase();
+    const isBicolink = host === 'bicolink.com' || host.endsWith('.bicolink.com') || host === 'bicolink.xyz' || host.endsWith('.bicolink.xyz');
+    const isBewbin = host === 'bewbin.com' || host.endsWith('.bewbin.com');
+    const isLegacy = host === 'lajangspot.web.id' || host.endsWith('.lajangspot.web.id');
+ 
+    let redirecting = false;
+    let ajaxHooked = false;
+    let observer = null;
+    let observerTimer = 0;
+    let interval = 0;
+    let timeout = 0;
+ 
+    function stop() {
+        if (observer) {
+            observer.disconnect();
+            observer = null;
+        }
+        if (observerTimer) {
+            clearTimeout(observerTimer);
+            observerTimer = 0;
+        }
+        if (interval) {
+            clearInterval(interval);
+            interval = 0;
+        }
+        if (timeout) {
+            clearTimeout(timeout);
+            timeout = 0;
+        }
+    }
+ 
+    function normalize(value) {
+        if (!value) return '';
+        const textarea = document.createElement('textarea');
+        textarea.innerHTML = String(value).trim();
+        let result = textarea.value.replace(/\\\//g, '/').trim();
+        try {
+            return new URL(result, location.href).href;
+        } catch (_) {
+            return '';
+        }
+    }
+ 
+    function readLock() {
+        try {
+            return JSON.parse(sessionStorage.getItem(LOCK_KEY) || 'null');
+        } catch (_) {
+            return null;
+        }
+    }
+ 
+    function redirectOnce(value) {
+        if (redirecting) return false;
+        const target = normalize(value);
+        if (!/^https?:\/\//i.test(target) || target === location.href) return false;
+ 
+        const previous = readLock();
+        if (previous && previous.url === target && Date.now() - previous.time < LOCK_TTL) {
+            return false;
+        }
+ 
+        redirecting = true;
+        stop();
+        try {
+            sessionStorage.setItem(LOCK_KEY, JSON.stringify({ url: target, time: Date.now() }));
+        } catch (_) {
+        }
+        location.replace(target);
+        return true;
+    }
+ 
+    function metaRefreshUrl() {
+        const meta = document.querySelector('meta[http-equiv="refresh" i]');
+        if (!meta) return '';
+        const match = (meta.getAttribute('content') || '').match(/(?:^|;)\s*url\s*=\s*(.+)$/i);
+        return match ? normalize(match[1].replace(/^['"]|['"]$/g, '')) : '';
+    }
+ 
+    function applyBewbinCookie(name) {
+        const source = Array.from(document.scripts, script => script.textContent || '').join('\n');
+        const match = source.match(new RegExp(name + "=([^;\"']+)"));
+        if (!match) return false;
+        document.cookie = `${name}=${match[1]}; path=/; max-age=600; SameSite=Lax`;
+        return true;
+    }
+ 
+    function unwrapGoogle(target) {
+        try {
+            const url = new URL(target);
+            if (!/(^|\.)google\.[a-z.]+$/i.test(url.hostname) || url.pathname !== '/url') return '';
+            const inner = url.searchParams.get('url') || url.searchParams.get('q');
+            return /^https?:\/\//i.test(inner || '') ? inner : '';
+        } catch (_) {
+            return '';
+        }
+    }
+ 
+    function bewbinGeoDestination() {
+        for (const element of document.querySelectorAll('[data-url], a[href]')) {
+            for (const value of [element.getAttribute('data-url'), element.getAttribute('href')]) {
+                const target = normalize(value);
+                try {
+                    const url = new URL(target);
+                    const targetHost = url.hostname.replace(/^www\./i, '').toLowerCase();
+                    if ((targetHost === 'bewbin.com' || targetHost.endsWith('.bewbin.com')) && url.searchParams.has('geo')) {
+                        return url.href;
+                    }
+                } catch (_) {
+                }
+            }
+        }
+        return '';
+    }
+ 
+    function externalDestination(value) {
+        const target = normalize(value);
+        if (!/^https?:\/\//i.test(target)) return '';
+        try {
+            const targetHost = new URL(target).hostname.replace(/^www\./i, '').toLowerCase();
+            if (targetHost === host || targetHost === 'bicolink.com' || targetHost.endsWith('.bicolink.com') || targetHost === 'bicolink.xyz' || targetHost.endsWith('.bicolink.xyz') || targetHost === 'bewbin.com' || targetHost.endsWith('.bewbin.com')) return '';
+        } catch (_) {
+            return '';
+        }
+        return target;
+    }
+ 
+    function finalDestination() {
+        const meta = document.querySelector('meta[name="og:description" i], meta[property="og:description" i]');
+        if (!meta) return '';
+        const content = meta.getAttribute('content') || '';
+        const match = content.match(/https?:\/\/[^\s<>"']+/i);
+        return match ? externalDestination(match[0]) : '';
+    }
+ 
+    function readyDestination() {
+        const ready = document.querySelector('a.get-link[href^="http://"], a.get-link[href^="https://"]');
+        return ready ? externalDestination(ready.href) : '';
+    }
+ 
+    function hookAjaxResult() {
+        if (ajaxHooked || !window.jQuery) return false;
+        const $ = window.jQuery;
+        $(document).on('ajaxSuccess.bicolinkBypass', function (_event, _xhr, settings, result) {
+            try {
+                const request = new URL(settings.url, location.href);
+                if (request.origin !== location.origin || request.pathname !== '/links/go') return;
+                const payload = typeof result === 'string' ? JSON.parse(result) : result;
+                const target = externalDestination(payload && payload.url);
+                if (target) redirectOnce(target);
+            } catch (_) {
+            }
+        });
+        ajaxHooked = true;
+        return true;
+    }
+ 
+    function handleBicolink() {
+        if (location.pathname === '/links/go') return false;
+ 
+        if (location.search.includes('type=wordpress')) {
+            hookAjaxResult();
+            const target = finalDestination();
+            if (target) return redirectOnce(target);
+ 
+            const ready = readyDestination();
+            if (ready) return redirectOnce(ready);
+            return false;
+        }
+ 
+        if (/^\/al\/[^/]+\/?$/i.test(location.pathname)) {
+            const free = document.querySelector('#ntAlFree[href], a.nt-al-opt-free[href]');
+            if (free) return redirectOnce(free.href);
+        }
+ 
+        if (host === 'go.bicolink.net') {
+            const captcha = document.querySelector('#fake-captcha:not(.clicked)');
+            if (captcha) {
+                captcha.classList.add('clicked');
+                captcha.click();
+            }
+            const ready = readyDestination();
+            if (ready) return redirectOnce(ready);
+        }
+ 
+        return false;
+    }
+ 
+    function handleBewbin() {
+        if (new URLSearchParams(location.search).has('data')) {
+            applyBewbinCookie('wpsafelink_go');
+            const target = metaRefreshUrl();
+            if (target) return redirectOnce(target);
+        }
+ 
+        if (new URLSearchParams(location.search).has('time')) {
+            const target = metaRefreshUrl();
+            if (target) return redirectOnce(target);
+        }
+ 
+        const refresh = metaRefreshUrl();
+        if (refresh) {
+            applyBewbinCookie('wpsl_gr_token');
+            applyBewbinCookie('wpsl_gr_pending');
+            const inner = unwrapGoogle(refresh);
+            return redirectOnce(inner || refresh);
+        }
+ 
+        const geo = bewbinGeoDestination();
+        if (geo) return redirectOnce(geo);
+ 
+        const timed = document.querySelector('#wpsafe-link a[href*="?time="], #wpsafe-link a[href*="&time="]');
+        if (timed) return redirectOnce(timed.href);
+ 
+        return false;
+    }
+ 
+    function decodeBase64(value) {
+        try {
+            return atob(value);
+        } catch (_) {
+            return '';
+        }
+    }
+ 
+    function resolveLegacy(value, depth = 0) {
+        if (!value || depth > 3) return '';
+        const raw = String(value).trim();
+        if (/^https?:\/\//i.test(raw)) return raw;
+ 
+        const decoded = decodeBase64(raw);
+        if (decoded && decoded !== raw) {
+            if (/^https?:\/\//i.test(decoded)) return decoded;
+            try {
+                const data = JSON.parse(decoded);
+                const nested = resolveLegacy(data.safelink || data.link || data.url || data.linkr, depth + 1);
+                if (nested) return nested;
+            } catch (_) {
+            }
+        }
+ 
+        try {
+            const parsed = new URL(raw, location.href);
+            for (const key of ['safelink_redirect', 'url', 'target', 'goto', 'r', 'out', 'u', 'link']) {
+                const nested = resolveLegacy(parsed.searchParams.get(key), depth + 1);
+                if (nested) return nested;
+            }
+        } catch (_) {
+        }
+        return '';
+    }
+ 
+    function handleLegacy() {
+        const values = [];
+        for (const selector of [
+            'input[name="go"]',
+            'input[name="newwpsafelink"]',
+            'input[name="wpsafelink"]',
+            'input[name="wpsafelink_redirect"]',
+            '#wpsafe-link a[href]'
+        ]) {
+            const element = document.querySelector(selector);
+            if (element) values.push(element.value || element.href || '');
+        }
+        for (const value of values) {
+            const target = resolveLegacy(value);
+            if (target && redirectOnce(target)) return true;
+        }
+        return false;
+    }
+ 
+    function run() {
